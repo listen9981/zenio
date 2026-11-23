@@ -1,0 +1,13 @@
+#ifndef ZENIO_VERSION_H
+#define ZENIO_VERSION_H
+
+// 自动生成的版本头文件: 版本号来自顶层 CMake 的 project() VERSION 定义,
+// 修改 CMakeLists.txt 中的版本号后重新配置即可让所有内置驱动的版本同步变化。
+
+#define ZENIO_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define ZENIO_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define ZENIO_VERSION_PATCH @PROJECT_VERSION_PATCH@
+
+#define ZENIO_VERSION_STRING "@PROJECT_VERSION@"
+
+#endif
