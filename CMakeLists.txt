@@ -39,12 +39,12 @@ option(ZENIO_BUILD_SHARED_LIBS "Build shared libraries" ON)
 option(ZENIO_INSTALL "Install zenio" OFF)
 
 # ASAN 和 TSAN 互斥, 同时启用时优先 ASAN
-if (ZEPHYR_ENABLE_ASAN)
-    set(ZEPHYR_ENABLE_TSAN OFF)
+if (ZENIO_ENABLE_ASAN)
+    set(ZENIO_ENABLE_TSAN OFF)
     add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
     add_link_options(-fsanitize=address)
-elseif (ZEPHYR_ENABLE_TSAN)
-    set(ZEPHYR_ENABLE_ASAN OFF)
+elseif (ZENIO_ENABLE_TSAN)
+    set(ZENIO_ENABLE_ASAN OFF)
     add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
     add_link_options(-fsanitize=thread)
 endif ()
@@ -96,4 +96,4 @@ if (ZENIO_INSTALL)
             DESTINATION lib/cmake/zenio
     )
 
-endif()
+endif ()
