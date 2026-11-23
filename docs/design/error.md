@@ -10,6 +10,7 @@
 
 - 运行时 API 的错误一律走异常, 不用 `Result` 包装返回值 (S3)。
 - `Result` 有三个用处: 用户自己的可失败域; `Task` 产出的存储 (见 design/task.md); `Try` 的产出。
+- `detail::VoidToMonostate` 也定义在 `result.h` 里。它把 `void` 映射成 `std::monostate`, `Result<void>` 和 `Select` 的 void 分支共用, 见 design/select.md。
 - 异常在模块之间怎么传播, 由各模块的文档规定: `JoinSet` 见 design/join_set.md, 游离任务见 design/spawn.md。
 - **命名规则 (S24)**: 异常类型的名字一律以 `Error` 结尾, 一眼能认出是异常类型。v1 一共四个: `Error`、`SystemError`、`CancelledError`、`ElapsedError`。以后新增的异常类型照此。
 
@@ -102,6 +103,14 @@ public:
 ### 2.2 `zenio/result.h`
 
 ```cpp
+namespace zenio::detail {
+
+//! @brief void 映射成 std::monostate, 其它类型原样保留。Result<void> 和 Select 的 void 分支都用它
+template <class T>
+using VoidToMonostate = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
+
+}  // namespace zenio::detail
+
 namespace zenio {
 
 /**
@@ -112,7 +121,7 @@ namespace zenio {
 template <class T, class E = std::error_code>
 class Result {
 public:
-    using OkType = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
+    using OkType = detail::VoidToMonostate<T>;
 
     //! @brief 空态: 尚未产出, 既不是 Ok 也不是 Err
     Result() = default;

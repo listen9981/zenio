@@ -76,6 +76,7 @@ API 以 tokio 为基准: 几乎所有 API 来自 tokio, 按本项目命名约定
 | S24 | 异常类型的名字一律以 `Error` 结尾, 一眼能认出是异常类型: `Error`、`SystemError`、`CancelledError`、`ElapsedError`。以后新增的异常类型照此 | 讨论中的补充说明 |
 | S25 | 定时器直接移植 tokio 的时间轮 (传统实现, 在 `runtime/time/` 下), 精度 1 毫秒就够。tokio 源码位置: `~/workspace/from_git/tokio`。见 design/timer.md | 讨论中的补充说明 |
 | S26 | 定时器不放进 Poller, 是独立的子系统: 时间轮加时间源单独成驱动。调度器的空闲等待路径按顺序驱动 Poller 和定时器, Poller 只管 fd | 讨论中的补充说明 |
+| S27 | `Select` 的结果直接用 `std::variant`: 产出 `void` 的分支映射成 `std::monostate`; 至少 1 个、至多 64 个分支, 与 tokio 的 `select!` 一致。见 design/select.md | 讨论中的补充说明 |
 
 ### 1.5 工作假设
 
@@ -185,7 +186,7 @@ zenio::Task<void> EchoServer(zenio::net::SocketAddr addr) {
                 joins.AbortAll();
                 break;
             }
-            auto [stream, peer] = std::move(result).get<1>();   // (TcpStream, SocketAddr), 与 tokio 一致
+            auto [stream, peer] = std::get<1>(std::move(result));   // (TcpStream, SocketAddr), 与 tokio 一致
             joins.Spawn(EchoConn(std::move(stream)));
         }
     } catch (const zenio::CancelledError&) {
