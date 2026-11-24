@@ -77,6 +77,9 @@ API 以 tokio 为基准: 几乎所有 API 来自 tokio, 按本项目命名约定
 | S25 | 定时器直接移植 tokio 的时间轮 (传统实现, 在 `runtime/time/` 下), 精度 1 毫秒就够。tokio 源码位置: `~/workspace/from_git/tokio`。见 design/timer.md | 讨论中的补充说明 |
 | S26 | 定时器不放进 Poller, 是独立的子系统: 时间轮加时间源单独成驱动。调度器的空闲等待路径按顺序驱动 Poller 和定时器, Poller 只管 fd | 讨论中的补充说明 |
 | S27 | `Select` 的结果直接用 `std::variant`: 产出 `void` 的分支映射成 `std::monostate`; 至少 1 个、至多 64 个分支, 与 tokio 的 `select!` 一致。见 design/select.md | 讨论中的补充说明 |
+| S28 | 单元测试直接链接库的目标文件 (OBJECT 库 `zenio_obj`), 不经过共享库; `zenio::detail` 里的东西一律不标 `ZENIO_EXPORT`。见 design/build.md 2.2、3.2 | 审查 M1、M2 后的决定 |
+| S29 | ASAN 测试不降低检测项, 包括不关闭 container-overflow。遇到疑似误报先确认构建目录是干净的; 能复现就记录步骤并登记债务 | 审查 M1、M2 后的决定 |
+| S30 | include 顺序里平台头单独一组: 项目头 → 标准库 → 平台头 → 第三方。`.clang-format` 还没有对应的分类, 暂不由工具强制。见 `docs/coding-style.md` | 审查 M1、M2 后的决定 |
 
 ### 1.5 工作假设
 
@@ -217,8 +220,9 @@ int main() {
 
 | 编号 | 里程碑 | 验收标准 | 任务书 | 状态 |
 |------|--------|----------|--------|------|
-| M1 | 公共头文件: `zenio.h`、`detail/export.h`、`detail/context.h` 和全部公开头文件的声明, 不含实现 | API 编译检查通过: 1.8 的目标用法只凭 `<zenio/zenio.h>` 能编译, 不要求链接 | design/milestones/M1.md (已审查) | 未开始 |
-| M2 | 基础设施的实现: `error`、`result`、`detail/fd`、`net/address`, 以及构建配置 (符号可见性、警告选项、FILE_SET、测试目录) | 各子系统文档列出的单测全部通过; API 编译检查仍然通过; D2 清偿 | design/milestones/M2.md (已审查) | 未开始 |
+| M1 | 公共头文件: `zenio.h`、`detail/export.h`、`detail/context.h` 和全部公开头文件的声明, 不含实现 | API 编译检查通过: 1.8 的目标用法只凭 `<zenio/zenio.h>` 能编译, 不要求链接 | design/milestones/M1.md (已审查) | 已完成 (R1 复验)。实现会话自述的验证: `cmake -S . -B cmake-build-m1 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DZENIO_BUILD_TESTS=ON && cmake --build cmake-build-m1`, 三个目标 (`zenio`、`zenio_unittest`、`zenio_api_compile_check`) 全部构建通过; 反向检查 (0/65 个分支、引用产出分支、`Result<bool>` 布尔转换、`JoinSet` 任务类型、`SpawnAndSeize` 漏写 `co_await` 的警告) 全部符合预期 |
+| M2 | 基础设施的实现: `error`、`result`、`detail/fd`、`net/address`, 以及构建配置 (符号可见性、警告选项、FILE_SET、测试目录) | 各子系统文档列出的单测全部通过; API 编译检查仍然通过; D2 清偿 | design/milestones/M2.md (已审查) | 已完成 (R1 复验)。实现会话自述的验证: `cmake -S . -B cmake-build-m2 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DZENIO_BUILD_TESTS=ON && cmake --build cmake-build-m2 && ctest --test-dir cmake-build-m2 --output-on-failure`, 40 个用例全部通过; `-Wall -Wextra` 下零警告; `cmake -S . -B cmake-build-install -G Ninja -DZENIO_INSTALL=ON` 配置成功 |
+| R1 | M1、M2 审查返工: `Result` 的构造函数、测试改为链接目标文件、ASAN 设置等 | 见 design/milestones/R1.md 第 5 节 | design/milestones/R1.md (已审查) | 已完成。验证: `cmake -S . -B cmake-build-r1 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DZENIO_BUILD_TESTS=ON && cmake --build cmake-build-r1 && ctest --test-dir cmake-build-r1 --output-on-failure` (42 项全过, 四个目标 `zenio_obj`/`zenio`/`zenio_unittest`/`zenio_api_compile_check`, 零警告); `nm -gU cmake-build-r1/src/zenio/libzenio*.dylib \| grep 'zenio::detail'` 无输出; 全新目录 `-DZENIO_ENABLE_ASAN=ON` 构建后不设 `ASAN_OPTIONS` 直接运行单测, 42 项全过无报告; `-DZENIO_BUILD_SHARED_LIBS=OFF` 构建且 ctest 通过; `-DZENIO_INSTALL=ON` 配置成功; 改动文件 clang-format 无差异; `Result<bool>` 布尔转换与 `Select()` 反向检查仍不能编译 |
 | M3 | Task 与单线程 Runtime: `Task<T>`、`Try`、`Builder::CurrentThread()`、`BlockOn`、上下文传播、单线程调度循环 | 10 万层嵌套 `co_await` 不爆栈; 异常在 `co_await` 处原样重抛; `Try` 把任务异常收进 `Err`, `CancelledError` 也被收进去 | 未写, M2 完成前细化 | 未开始 |
 | M4 | 定时器 (移植 tokio 时间轮)、kqueue 与 Poller (单线程模式): `Sleep`、TCP 的 accept / connect / read / write | 时间轮的单元测试 (移植自 tokio) 通过; `Sleep` 的精度和取消测试通过; loopback 回显通过; 上千并发连接通过; ASAN 下无泄漏 | 未写, M3 完成前细化 | 未开始 |
 | M5 | 任务派发与取消: `Spawn`、`SpawnAndSeize`、`JoinHandle`、`AbortHandle`、`JoinSet`、`Select`、`Uncancellable` | 取消挂起中的 read 成功; `SpawnAndSeize` 的 child 在调用方的 worker 上启动而调用方被重新投递; `JoinHandle` 丢弃后任务继续运行; `JoinAll` 重抛任务异常且结果按 spawn 顺序排列; `Select` 的输家被取消; 析构后没有残留任务 | 未写, M4 完成前细化 | 未开始 |
@@ -232,7 +236,6 @@ int main() {
 
 | 编号 | 债务 | 来源 | 处理 |
 |------|------|------|------|
-| D2 | `cmake/version.h.in` 的注释提到"内置驱动", 与本项目无关 | 初始代码 | M2 修正后移除 |
 | D3 | epoll 后端在开发机 (macOS) 上无法验证 | 环境 | 在用户提供的 Linux 服务器上验证 (S21); 验证通过之前 epoll 标记为未验证 |
 | D4 | 每次等待都重新 arm (一次性注册), 比边缘触发加就绪提示多一次系统调用 | 设计取舍 | 基准显示成为瓶颈时再改 |
 | D5 | 协程帧用默认 `operator new` / `delete`, 没有内存池 | 设计取舍 | 同上 |

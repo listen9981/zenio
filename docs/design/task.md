@@ -212,7 +212,7 @@ public:
 
 所有返回 awaiter 的操作都按下面的规则写 (S8)。
 
-1. **命名和位置**: 返回值的类型是 `zenio::detail` 里的一个类, 名字是操作名加 `Awaiter`, 如 `AcceptAwaiter`。除了 `Task` 自己用的 `InitialAwaiter`、`FinalAwaiter`、`YieldAwaiter` (它们在 `zenio/detail/context.h`), 全部声明在 `zenio/detail/awaiters.h`。`awaiters.h` 被很多公开头文件包含, 所以它不包含任何公开头文件, 只前置声明用到的东西: `JoinSet<T>`、`SelectResult<Ts...>`、`net::TcpListener`、`net::TcpStream`、`net::UdpSocket`、`signal::Signal`。
+1. **命名和位置**: 返回值的类型是 `zenio::detail` 里的一个类, 名字是操作名加 `Awaiter`, 如 `AcceptAwaiter`。除了 `Task` 自己用的 `InitialAwaiter`、`FinalAwaiter`、`YieldAwaiter` (它们在 `zenio/detail/context.h`), 全部声明在 `zenio/detail/awaiters.h`。`awaiters.h` 被很多公开头文件包含, 所以它不包含任何公开头文件, 只前置声明用到的东西 (M1 偏差): 类 `JoinHandle<T>`、`JoinSet<T>`、`net::TcpListener`、`net::TcpStream`、`net::UdpSocket`、`signal::Signal`, 以及六个创建方的函数声明 `SpawnAndSeize`、`Uncancellable`、`Select` (带完整约束, `SelectOutputType` 因此也定义在 `awaiters.h`)、`Sleep`、`SleepUntil`——限定名的友元必须有先前声明, 这些声明与各自头文件里的逐字一致。`SelectResult` 不在其中: 别名模板没有前置声明, `SelectAwaiter` 的 `await_resume()` 直接写开 `std::variant`, 不引用别名。
 2. **三个成员函数**:
 
    ```cpp

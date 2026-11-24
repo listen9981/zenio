@@ -174,11 +174,15 @@ public:
     [[nodiscard]] OkType value_or(OkType fallback) &&;
 
 private:
+    //! @brief 私有构造函数的标签。不能靠参数类型区分 Ok 和 Err, 见第 6 节
+    struct OkTag {};
+    struct ErrTag {};
+
     template <class U>
         requires(!std::is_void_v<U>)
-    explicit Result(U&& value);
+    explicit Result(OkTag, U&& value);
 
-    explicit Result(E err);
+    explicit Result(ErrTag, E err);
 
     std::variant<std::monostate, OkType, E> value_;
 };
@@ -196,8 +200,10 @@ namespace zenio {
 /**
  * @brief 把任务的异常收进 Result, 供不想用异常的代码使用
  * @note CancelledError 也会被收进 Err
+ * @note 不支持产出引用的 Task<T&>: Result 的存储里放不了引用, 所以用约束拦住
  */
 template <class T>
+    requires(!std::is_reference_v<T>)
 [[nodiscard]] Task<Result<T, std::exception_ptr>> Try(Task<T> task) {
     try {
         if constexpr (std::is_void_v<T>) {
@@ -239,6 +245,7 @@ template <class T>
 - `value()`、`error()` 用 `std::get<1>`、`std::get<2>` 取, 状态不对时由标准库抛 `std::bad_variant_access`。
 - `Ok()` (T 为 void) 先默认构造, 再 `value_.emplace<1>()`。不能让默认构造的结果直接当 Ok 用。
 - `value_or` 的 `const&` 版本返回 `value()` 的拷贝或 fallback; `&&` 版本两者都移动。
+- 私有构造函数带一个标签参数: `Ok(U&&)` 走带 `OkTag` 的那个, `Err` 走带 `ErrTag` 的那个。
 
 ## 4. 关键流程
 
@@ -259,11 +266,13 @@ template <class T>
 
 ## 6. 已知的坑
 
+- **私有构造函数不能靠参数类型区分 Ok 和 Err**: `T` 和 `E` 是同一种类型时 (比如 `Result<std::error_code>`, `E` 的默认值就是它), `Ok(值)` 和 `Err(值)` 的实参类型一样, 重载决议会把 `Ok` 判给 `Err` 那个构造函数, 结果悄悄变成错误状态。M2 审查时实测确认: `Result<std::error_code>::Ok(ec)` 得到的是 `Err`。所以两个私有构造函数各带一个标签类型。
 - **`Result<bool>` 的布尔转换**: 对布尔载荷做显式布尔转换是语义陷阱, `!r` 取到的是"是否 Ok"而不是载荷。所以 `Result<bool>` 删除了 `operator bool`, 布尔载荷必须显式取值: `r.value()`、`r.value_or(false)`、`(r.is_ok() && r.value())`。
 - **errno 被覆盖**: 构造 `SystemError` 之前不能调用任何可能改 errno 的函数。`message_` 在构造函数里生成, 之后不再调用系统函数。
 - **`value_or` 的两个重载**: `const&` 版本要求 `OkType` 可拷贝; 只可移动的类型必须用 `&&` 版本, 写成 `std::move(r).value_or(...)`。
 - **`await_resume` 不能标 `noexcept`**: 它要重抛异常。
 - **`Try` 的 `catch (...)` 也接住 `CancelledError`** (S17)。取消不会因此丢失: 令牌仍是取消状态, 当前协程的下一个 await 点还会抛 `CancelledError`。
+- **`Try` 不支持 `Task<T&>`**: `Result<T&>` 的存储里放不了引用。用约束拦住, 报错才指得清楚。`static_assert` 放在函数体里不起作用, 因为返回类型先被实例化、先报错, 编译器不会再去实例化函数体。
 - **`std::variant` 的 `valueless_by_exception`**: `OkType` 的拷贝或移动构造抛异常时会出现第四种状态。v1 不处理, 约定放进 `Result` 的类型移动构造不抛。
 
 ## 7. 验收测试
@@ -284,6 +293,7 @@ M2 交付, 文件在 `tests/zenio/`。
 - `Result<int>::Ok(42)`: `is_ok()`, `value() == 42`; `error()` 抛异常。
 - `Result<int>::Err(err)`: `is_err()`, `error() == err`; `value()` 抛异常。
 - `Result<void>`: `Ok()` 之后 `is_ok()`, `value()` 不抛; `Err(err)` 之后 `is_err()`。
+- `T` 和 `E` 是同一种类型: `Result<std::error_code>::Ok(ec)` 是 Ok 且 `value() == ec`, `Err(ec)` 是 Err; 左值和右值实参都要测。`Result<int, int>` 同理。
 - 编译期检查。删除的函数在非模板上下文的 `requires` 表达式里是硬错误, 不是 false, 所以先把检查写进 concept:
 
   ```cpp

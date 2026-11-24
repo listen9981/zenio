@@ -23,6 +23,7 @@ template <class... Awaitables> class SelectAwaiter;
 /**
  * @brief 分支的产出类型要能放进 std::variant
  * @note 产出是引用的分支不支持: std::variant 里放不了引用
+ * @note 定义在 zenio/detail/awaiters.h, 不在本文件: SelectAwaiter 的友元声明需要完整约束 (M1 偏差)
  */
 template <class T>
 concept SelectOutputType = !std::is_reference_v<T>;

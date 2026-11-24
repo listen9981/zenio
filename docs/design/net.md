@@ -313,6 +313,7 @@ namespace zenio::detail {
 
 /**
  * @brief 独占一个 fd, 析构时关闭
+ * @note 单元测试能直接用它, 是因为单测链接的是库的目标文件 (S28), 不需要导出
  */
 class UniqueFd {
 public:
@@ -327,7 +328,7 @@ public:
 
     ~UniqueFd();
 
-    [[nodiscard]] int  get() const noexcept;
+    [[nodiscard]] int get() const noexcept;
     [[nodiscard]] bool is_valid() const noexcept;
 
     //! @brief 放弃所有权并返回 fd, 之后本对象不再持有 fd
@@ -385,11 +386,12 @@ struct IoObject {
 
 `SocketAddr::Parse(text)`:
 
-1. 找最后一个 `]`。有的话按 IPv6 处理: `]` 前面必须有 `[`, 后面必须紧跟 `:` 和端口。
-2. 没有 `]` 时按 IPv4 处理: 找最后一个 `:`, 前面是地址, 后面是端口。
-3. 地址部分拷进以空字符结尾的缓冲区, 交给 `inet_pton` 解析; 它返回 0 表示不是合法地址。
-4. 端口部分用 `std::from_chars` 解析, 必须整个是十进制数字, 范围 0 ~ 65535。
-5. 任何一步不满足就抛 `std::invalid_argument`。
+1. `text` 的第一个字符是 `[`: 按 IPv6 处理。找最后一个 `]`, 它后面必须紧跟 `:` 和端口, 方括号里是地址。
+2. 否则按 IPv4 处理: 找最后一个 `:`, 前面是地址, 后面是端口。地址里不允许出现 `[` 或 `]`。
+3. IPv6 地址拷进以空字符结尾的缓冲区, 交给 `inet_pton`; 它返回 0 表示不是合法地址。
+4. IPv4 地址自己解析, 不交给 `inet_pton`: 必须是四段, 用 `.` 分开, 每段 1 到 3 个十进制数字, 数值不超过 255, 除 `0` 之外不允许前导零。理由见第 6 节。
+5. 端口部分用 `std::from_chars` 解析, 必须整个是十进制数字, 范围 0 ~ 65535。端口允许前导零, `"0.0.0.0:00080"` 的端口是 80。
+6. 任何一步不满足就抛 `std::invalid_argument`。
 
 `SocketAddr::to_string()`:
 
@@ -421,6 +423,7 @@ struct IoObject {
 - **fd 编号被复用**: fd 关闭后编号可能立刻被新对象占用。Poller 的注册表靠对象代号区分, 见 design/poller.md。
 - **花括号实参推导不出模板参数**: 见 2.4。
 - **`inet_pton` 需要以空字符结尾的字符串**: `std::string_view` 不带空字符, 必须先拷贝。
+- **IPv4 的前导零**: `inet_pton` 对 `010.0.0.1` 这种写法的处理两个平台不一致, M2 审查时在 macOS 上实测它被当成 `10.0.0.1` 接受。所以 IPv4 地址不交给 `inet_pton`, 自己按 4.1 的严格规则解析, 两个平台行为一致。
 - **`close` 遇到 `EINTR`**: 不重试。Linux 上重试可能关掉别的线程刚打开的 fd。
 
 ## 7. 验收测试
@@ -437,8 +440,9 @@ struct IoObject {
 - `SocketAddr(Ipv6Addr::localhost(), 7777)`: `is_ipv6()`, `ipv6()` 是回环地址。
 - `Parse("127.0.0.1:7777")` 等于 `SocketAddr(Ipv4Addr(127, 0, 0, 1), 7777)`。
 - `Parse("[::1]:7777")` 等于 `SocketAddr(Ipv6Addr::localhost(), 7777)`。
-- `Parse("0.0.0.0:0")` 成功。
+- `Parse("0.0.0.0:0")` 成功。`Parse("0.0.0.0:00080")` 等于 `SocketAddr(Ipv4Addr::unspecified(), 80)`。
 - 下面这些抛 `std::invalid_argument`: 空串、`"127.0.0.1"`、`"127.0.0.1:"`、`"127.0.0.1:70000"`、`"256.1.1.1:80"`、`"::1:80"` (没有方括号)、`"example.com:80"`、`"[::1]"`。
+- 解析的严格性 (M2 审查后补充)。下面这些也抛 `std::invalid_argument`: `"x[::1]:80"` (方括号前有字符)、`"010.0.0.1:80"` 和 `"127.0.00.1:80"` (地址段有前导零)、`"127.0.1:80"` (只有三段)、`"1.2.3.4.:80"` (以点结尾)。
 - `to_string()`: `SocketAddr(Ipv4Addr(127, 0, 0, 1), 7777)` 是 `"127.0.0.1:7777"`; `::1` 是 `"[::1]:7777"`; `2001:db8::1` 是 `"[2001:db8::1]:80"`。
 - 往返: 对上面三个地址, `Parse(a.to_string()) == a`。
 
