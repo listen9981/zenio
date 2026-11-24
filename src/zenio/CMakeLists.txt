@@ -1,7 +1,11 @@
 file(GLOB_RECURSE zenio_srcs CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 file(GLOB_RECURSE zenio_hdrs CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.h)
 
-add_library(zenio ${ZENIO_LIB_TYPE} ${zenio_srcs} ${zenio_hdrs})
+# S28: 全部源文件只编译一次 (zenio_obj), 库和单元测试共用这份目标文件,
+# 单测直接链接 zenio_obj, 不经过共享库 (design/build.md 2.2、3.2)。
+add_library(zenio_obj OBJECT ${zenio_srcs} ${zenio_hdrs})
+
+add_library(zenio ${ZENIO_LIB_TYPE} $<TARGET_OBJECTS:zenio_obj>)
 add_library(zenio::zenio ALIAS zenio)
 
 set_target_properties(zenio PROPERTIES
@@ -11,27 +15,49 @@ set_target_properties(zenio PROPERTIES
         SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
-target_include_directories(zenio PRIVATE
+target_include_directories(zenio_obj PRIVATE
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
         $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/src>
 )
 
 if (ZENIO_INSTALL)
 
-    # 需要导出安装的头文件列表, 仅导出外部使用的 API 及其必须依赖导出的头文件, 其余内部实现的头文件不进此项
+    # 公开头文件清单 (design/build.md 2.4)。
+    # version.h 在构建目录里, 所以 BASE_DIRS 除 src/ 之外还要加上 ${CMAKE_BINARY_DIR}/src。
     target_sources(zenio
             PUBLIC
-            FILE_SET ZENIO_HEADERS
-            BASE_DIRS ${CMAKE_SOURCE_DIR}/src
+            FILE_SET zenio_headers
+            TYPE HEADERS
+            BASE_DIRS ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/src
             FILES
-            # .. 待定
+            ${CMAKE_SOURCE_DIR}/src/zenio/zenio.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/error.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/result.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/task.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/try.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/cancel.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/spawn.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/join_set.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/select.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/time.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/runtime.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/signal.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/net/address.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/net/tcp.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/net/udp.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/detail/export.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/detail/context.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/detail/awaiters.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/detail/fd.h
+            ${CMAKE_SOURCE_DIR}/src/zenio/detail/io_object.h
+            ${CMAKE_BINARY_DIR}/src/zenio/version.h
     )
 
     install(TARGETS zenio
             EXPORT zenioTargets
             LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-            FILE_SET ZENIO_HEADERS DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+            FILE_SET zenio_headers DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
 
 endif ()

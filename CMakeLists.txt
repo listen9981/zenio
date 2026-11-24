@@ -38,6 +38,12 @@ option(ZENIO_ENABLE_TSAN "Enable thread sanitizer" OFF)
 option(ZENIO_BUILD_SHARED_LIBS "Build shared libraries" ON)
 option(ZENIO_INSTALL "Install zenio" OFF)
 
+# 全局编译标志, 只对 GCC 和 Clang 生效 (design/build.md 3.2)。
+# 公开的类和函数用 ZENIO_EXPORT 导出, 其余符号在共享库里不可见 (S23)。
+if (CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    add_compile_options(-Wall -Wextra -fvisibility=hidden)
+endif ()
+
 # ASAN 和 TSAN 互斥, 同时启用时优先 ASAN
 if (ZENIO_ENABLE_ASAN)
     set(ZENIO_ENABLE_TSAN OFF)
