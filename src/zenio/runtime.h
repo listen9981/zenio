@@ -5,6 +5,8 @@
 #include "zenio/spawn.h"
 #include "zenio/task.h"
 
+#include <cassert>
+#include <coroutine>
 #include <memory>
 
 namespace zenio::detail {
@@ -31,9 +33,13 @@ public:
 private:
     friend class Handle;
 
-    EnterGuard() noexcept;
+    EnterGuard() noexcept = default;
 
-    detail::PromiseContext* previous_ = nullptr;
+    //! @brief 还原, 只有正在生效的时候才做
+    void Reset() noexcept;
+
+    detail::PromiseContext* previous_ = nullptr;    //!< 进入之前的上下文, 可以是空指针
+    bool                    active_   = false;      //!< 正在生效
 };
 
 /**
@@ -58,6 +64,9 @@ public:
 
     [[nodiscard]] bool is_valid() const noexcept;
 
+    //! @brief 两个句柄指向同一个运行时
+    [[nodiscard]] bool operator==(const Handle& other) const noexcept;
+
     /**
      * @brief 把句柄登记为当前线程的上下文 (对应 Handle::enter)
      * @note 作用域内可以在普通线程上调用需要上下文的同步函数, 如 TcpListener::Bind(addr)
@@ -74,6 +83,8 @@ public:
 private:
     friend class Runtime;
     friend class Builder;
+
+    explicit Handle(std::shared_ptr<detail::RuntimeCore> core) noexcept;
 
     std::shared_ptr<detail::RuntimeCore> core_;
 };
@@ -127,6 +138,7 @@ public:
     /**
      * @brief 运行主任务直到结束
      * @return 任务的产出; 任务抛了异常就在调用线程上重抛
+     * @throws std::runtime_error 这个线程上已经有上下文, 或者 BlockOn 重入
      */
     template <class T>
     T BlockOn(Task<T> task);
@@ -142,8 +154,20 @@ private:
 
     explicit Runtime(std::shared_ptr<detail::RuntimeCore> core) noexcept;
 
+    //! @brief BlockOn 的非模板部分: 把 task 当作根任务运行, 直到没事可做
+    void RunRoot(std::coroutine_handle<> task);
+
     std::shared_ptr<detail::RuntimeCore> core_;
 };
+
+template <class T>
+T Runtime::BlockOn(Task<T> task) {
+    const auto handle = detail::TaskAccess::Handle(task);
+    assert(handle && "BlockOn 收到了无效的 Task");
+    RunRoot(handle);
+    assert(handle.done() && "RunRoot 返回时主任务应当已经结束");
+    return detail::TakeTaskResult<T>(handle.promise().storage_);
+}
 
 }    // namespace zenio::runtime
 

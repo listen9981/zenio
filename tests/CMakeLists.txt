@@ -3,3 +3,4 @@ include(GoogleTest)
 
 add_subdirectory(zenio)
 add_subdirectory(compile_check)
+add_subdirectory(link_check)

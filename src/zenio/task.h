@@ -4,15 +4,24 @@
 #include "zenio/detail/context.h"
 #include "zenio/result.h"
 
+#include <cassert>
 #include <coroutine>
 #include <exception>
+#include <type_traits>
 #include <utility>
+
+namespace zenio::detail {
+
+struct TaskAccess;
+
+}    // namespace zenio::detail
 
 namespace zenio {
 
 /**
  * @brief 惰性启动的协程任务
  * @note 被 co_await 时才开始执行; 结束时产出 T, 或把协程体内的异常原样重抛
+ * @note 协程帧归本对象所有, 在析构函数里销毁
  */
 template <class T>
 class [[nodiscard]] ZENIO_EXPORT Task {
@@ -36,6 +45,8 @@ public:
     Awaiter operator co_await() const noexcept;
 
 private:
+    friend struct detail::TaskAccess;
+
     explicit Task(std::coroutine_handle<promise_type> handle) noexcept;
 
     std::coroutine_handle<promise_type> handle_;
@@ -89,6 +100,7 @@ private:
     explicit Awaiter(std::coroutine_handle<promise_type> handle) noexcept;
 
     std::coroutine_handle<promise_type> handle_;
+    detail::PromiseContext*             saved_ = nullptr;    //!< 调用方的上下文, child 结束之后还原
 };
 
 /**
@@ -117,6 +129,8 @@ public:
     Awaiter operator co_await() const noexcept;
 
 private:
+    friend struct detail::TaskAccess;
+
     explicit Task(std::coroutine_handle<promise_type> handle) noexcept;
 
     std::coroutine_handle<promise_type> handle_;
@@ -168,6 +182,7 @@ private:
     explicit Awaiter(std::coroutine_handle<promise_type> handle) noexcept;
 
     std::coroutine_handle<promise_type> handle_;
+    detail::PromiseContext*             saved_ = nullptr;    //!< 调用方的上下文, child 结束之后还原
 };
 
 /**
@@ -196,6 +211,8 @@ public:
     Awaiter operator co_await() const noexcept;
 
 private:
+    friend struct detail::TaskAccess;
+
     explicit Task(std::coroutine_handle<promise_type> handle) noexcept;
 
     std::coroutine_handle<promise_type> handle_;
@@ -249,10 +266,291 @@ private:
     explicit Awaiter(std::coroutine_handle<promise_type> handle) noexcept;
 
     std::coroutine_handle<promise_type> handle_;
+    detail::PromiseContext*             saved_ = nullptr;    //!< 调用方的上下文, child 结束之后还原
 };
 
 //! @brief 让出执行权 (对应 tokio::task::yield_now)
 [[nodiscard]] ZENIO_EXPORT detail::YieldAwaiter Yield();
+
+}    // namespace zenio
+
+// —— Task 的成员函数定义 (M3), 见 design/task.md 2.4 ——
+
+namespace zenio::detail {
+
+/**
+ * @brief 库内部取 Task 的协程句柄
+ * @note 只有创建根任务的地方用 (Runtime::BlockOn); 协程体里一律走 co_await
+ */
+struct TaskAccess {
+    template <class T>
+    [[nodiscard]] static std::coroutine_handle<typename Task<T>::promise_type> Handle(const Task<T>& task) noexcept {
+        return task.handle_;
+    }
+};
+
+/**
+ * @brief 取走一个已经结束的 Task 的产出; 存的是异常就重抛
+ * @tparam T       产出类型, 即 await_resume() 的返回类型
+ * @tparam Stored  storage_ 的 OkType
+ * @note Task<T>::Awaiter::await_resume() 和 Runtime::BlockOn 共用。
+ *       Task<void> 的 storage_ 存 std::monostate, Task<T&> 存 T*, 所以 Stored 和 T 不总是同一个类型
+ */
+template <class T, class Stored>
+T TakeTaskResult(Result<Stored, std::exception_ptr>& storage) {
+    assert(!storage.is_empty() && "协程已经结束, storage_ 不该是空态");
+    if (storage.is_err()) {
+        std::rethrow_exception(std::move(storage).error());
+    }
+    if constexpr (std::is_void_v<T>) {
+        (void)std::move(storage).value();
+    } else if constexpr (std::is_reference_v<T>) {
+        return *std::move(storage).value();
+    } else {
+        return std::move(storage).value();
+    }
+}
+
+}    // namespace zenio::detail
+
+namespace zenio {
+
+// —— 主模板 ——
+
+template <class T>
+Task<T>::Task(std::coroutine_handle<promise_type> handle) noexcept : handle_(handle) {}
+
+template <class T>
+Task<T>::Task(Task&& other) noexcept : handle_(std::exchange(other.handle_, {})) {}
+
+template <class T>
+Task<T>& Task<T>::operator=(Task&& other) noexcept {
+    if (this != &other) {
+        Task discarded(std::move(*this));    // 原来的协程在语句结束时销毁
+        handle_ = std::exchange(other.handle_, {});
+    }
+    return *this;
+}
+
+template <class T>
+Task<T>::~Task() {
+    if (handle_) {
+        assert((!handle_.promise().started || handle_.done()) && "Task 在协程结束之前被销毁");
+        handle_.destroy();
+    }
+}
+
+template <class T>
+bool Task<T>::is_valid() const noexcept {
+    return static_cast<bool>(handle_);
+}
+
+template <class T>
+typename Task<T>::Awaiter Task<T>::operator co_await() const noexcept {
+    return Awaiter(handle_);
+}
+
+template <class T>
+Task<T> Task<T>::promise_type::get_return_object() {
+    return Task<T>(std::coroutine_handle<promise_type>::from_promise(*this));
+}
+
+template <class T>
+auto Task<T>::promise_type::initial_suspend() noexcept -> detail::InitialAwaiter<promise_type> {
+    return {};
+}
+
+template <class T>
+auto Task<T>::promise_type::final_suspend() noexcept -> detail::FinalAwaiter<promise_type> {
+    return {};
+}
+
+template <class T>
+void Task<T>::promise_type::return_value(T value) {
+    storage_ = Result<T, std::exception_ptr>::Ok(std::move(value));
+}
+
+template <class T>
+void Task<T>::promise_type::unhandled_exception() noexcept {
+    storage_ = Result<T, std::exception_ptr>::Err(std::current_exception());
+}
+
+template <class T>
+Task<T>::Awaiter::Awaiter(std::coroutine_handle<promise_type> handle) noexcept : handle_(handle) {}
+
+template <class T>
+bool Task<T>::Awaiter::await_ready() const noexcept {
+    assert(handle_ && "co_await 了一个无效的 Task");
+    return false;
+}
+
+template <class T>
+std::coroutine_handle<> Task<T>::Awaiter::await_suspend(std::coroutine_handle<> caller) noexcept {
+    promise_type& promise = handle_.promise();
+    assert(promise.continuation_ == nullptr && "一个 Task 只能被 co_await 一次");
+    promise.continuation_ = caller;
+    saved_                = detail::CurrentContext();
+    return handle_;
+}
+
+template <class T>
+T Task<T>::Awaiter::await_resume() {
+    detail::SetCurrentContext(saved_);
+    return detail::TakeTaskResult<T>(handle_.promise().storage_);
+}
+
+// —— Task<T&> 偏特化: 与主模板逐字相同, 只换产出相关的部分 ——
+
+template <class T>
+Task<T&>::Task(std::coroutine_handle<promise_type> handle) noexcept : handle_(handle) {}
+
+template <class T>
+Task<T&>::Task(Task&& other) noexcept : handle_(std::exchange(other.handle_, {})) {}
+
+template <class T>
+Task<T&>& Task<T&>::operator=(Task&& other) noexcept {
+    if (this != &other) {
+        Task discarded(std::move(*this));    // 原来的协程在语句结束时销毁
+        handle_ = std::exchange(other.handle_, {});
+    }
+    return *this;
+}
+
+template <class T>
+Task<T&>::~Task() {
+    if (handle_) {
+        assert((!handle_.promise().started || handle_.done()) && "Task 在协程结束之前被销毁");
+        handle_.destroy();
+    }
+}
+
+template <class T>
+bool Task<T&>::is_valid() const noexcept {
+    return static_cast<bool>(handle_);
+}
+
+template <class T>
+typename Task<T&>::Awaiter Task<T&>::operator co_await() const noexcept {
+    return Awaiter(handle_);
+}
+
+template <class T>
+Task<T&> Task<T&>::promise_type::get_return_object() {
+    return Task<T&>(std::coroutine_handle<promise_type>::from_promise(*this));
+}
+
+template <class T>
+auto Task<T&>::promise_type::initial_suspend() noexcept -> detail::InitialAwaiter<promise_type> {
+    return {};
+}
+
+template <class T>
+auto Task<T&>::promise_type::final_suspend() noexcept -> detail::FinalAwaiter<promise_type> {
+    return {};
+}
+
+template <class T>
+void Task<T&>::promise_type::return_value(T& value) {
+    storage_ = Result<T*, std::exception_ptr>::Ok(&value);
+}
+
+template <class T>
+void Task<T&>::promise_type::unhandled_exception() noexcept {
+    storage_ = Result<T*, std::exception_ptr>::Err(std::current_exception());
+}
+
+template <class T>
+Task<T&>::Awaiter::Awaiter(std::coroutine_handle<promise_type> handle) noexcept : handle_(handle) {}
+
+template <class T>
+bool Task<T&>::Awaiter::await_ready() const noexcept {
+    assert(handle_ && "co_await 了一个无效的 Task");
+    return false;
+}
+
+template <class T>
+std::coroutine_handle<> Task<T&>::Awaiter::await_suspend(std::coroutine_handle<> caller) noexcept {
+    promise_type& promise = handle_.promise();
+    assert(promise.continuation_ == nullptr && "一个 Task 只能被 co_await 一次");
+    promise.continuation_ = caller;
+    saved_                = detail::CurrentContext();
+    return handle_;
+}
+
+template <class T>
+T& Task<T&>::Awaiter::await_resume() {
+    detail::SetCurrentContext(saved_);
+    return detail::TakeTaskResult<T&>(handle_.promise().storage_);
+}
+
+// —— Task<void> 显式特化: 不是模板, 类外的定义加 inline ——
+
+inline Task<void>::Task(std::coroutine_handle<promise_type> handle) noexcept : handle_(handle) {}
+
+inline Task<void>::Task(Task&& other) noexcept : handle_(std::exchange(other.handle_, {})) {}
+
+inline Task<void>& Task<void>::operator=(Task&& other) noexcept {
+    if (this != &other) {
+        Task discarded(std::move(*this));    // 原来的协程在语句结束时销毁
+        handle_ = std::exchange(other.handle_, {});
+    }
+    return *this;
+}
+
+inline Task<void>::~Task() {
+    if (handle_) {
+        assert((!handle_.promise().started || handle_.done()) && "Task 在协程结束之前被销毁");
+        handle_.destroy();
+    }
+}
+
+inline bool Task<void>::is_valid() const noexcept {
+    return static_cast<bool>(handle_);
+}
+
+inline Task<void>::Awaiter Task<void>::operator co_await() const noexcept {
+    return Awaiter(handle_);
+}
+
+inline Task<void> Task<void>::promise_type::get_return_object() {
+    return Task<void>(std::coroutine_handle<promise_type>::from_promise(*this));
+}
+
+inline auto Task<void>::promise_type::initial_suspend() noexcept -> detail::InitialAwaiter<promise_type> {
+    return {};
+}
+
+inline auto Task<void>::promise_type::final_suspend() noexcept -> detail::FinalAwaiter<promise_type> {
+    return {};
+}
+
+inline void Task<void>::promise_type::return_void() {
+    storage_ = Result<void, std::exception_ptr>::Ok();
+}
+
+inline void Task<void>::promise_type::unhandled_exception() noexcept {
+    storage_ = Result<void, std::exception_ptr>::Err(std::current_exception());
+}
+
+inline Task<void>::Awaiter::Awaiter(std::coroutine_handle<promise_type> handle) noexcept : handle_(handle) {}
+
+inline bool Task<void>::Awaiter::await_ready() const noexcept {
+    assert(handle_ && "co_await 了一个无效的 Task");
+    return false;
+}
+
+inline std::coroutine_handle<> Task<void>::Awaiter::await_suspend(std::coroutine_handle<> caller) noexcept {
+    promise_type& promise = handle_.promise();
+    assert(promise.continuation_ == nullptr && "一个 Task 只能被 co_await 一次");
+    promise.continuation_ = caller;
+    saved_                = detail::CurrentContext();
+    return handle_;
+}
+
+inline void Task<void>::Awaiter::await_resume() {
+    detail::SetCurrentContext(saved_);
+    detail::TakeTaskResult<void>(handle_.promise().storage_);
+}
 
 }    // namespace zenio
 
