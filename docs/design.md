@@ -80,12 +80,13 @@ API 以 tokio 为基准: 几乎所有 API 来自 tokio, 按本项目命名约定
 | S28 | 单元测试直接链接库的目标文件 (OBJECT 库 `zenio_obj`), 不经过共享库; `zenio::detail` 里的东西一律不标 `ZENIO_EXPORT`。见 design/build.md 2.2、3.2 | 审查 M1、M2 后的决定 |
 | S29 | ASAN 测试不降低检测项, 包括不关闭 container-overflow。遇到疑似误报先确认构建目录是干净的; 能复现就记录步骤并登记债务 | 审查 M1、M2 后的决定 |
 | S30 | include 顺序里平台头单独一组: 项目头 → 标准库 → 平台头 → 第三方。`.clang-format` 还没有对应的分类, 暂不由工具强制。见 `docs/coding-style.md` | 审查 M1、M2 后的决定 |
+| S31 | S28 的例外: 库外代码会直接调用的 `zenio::detail` 符号必须标 `ZENIO_EXPORT`, 否则使用者链接共享库时缺符号。两类: 公开头文件里的模板实现要调用的非模板函数; 各操作的 awaiter 类 (标在类上)。每个里程碑有一张清单, 验收时对照。见 design/build.md 2.3 | M3 细化时的发现, 原型编成共享库验证过 |
 
 ### 1.5 工作假设
 
 以下各项未经确认, 当前按此推进。实现会话按原文实现。
 
-- **A1 `BlockOn` 与 Runtime 生命周期**: 见 design/runtime.md。
+- **A1 `BlockOn` 与 Runtime 生命周期**: 见 design/runtime.md。其中"只支持调用一次 `BlockOn`"已经由 A19 取代。
 - **A2 `JoinSet` 与 `Select` 的语义**: 见 design/join_set.md、design/select.md。
 - **A3 `EnableIo` / `EnableTime` 的规则**: 见 design/runtime.md。
 - **A4 运行时上下文隐式获取**: 见 design/task.md。
@@ -100,6 +101,15 @@ API 以 tokio 为基准: 几乎所有 API 来自 tokio, 按本项目命名约定
 - **A14 编译警告选项**: 库和测试都开启 `-Wall -Wextra`。见 design/build.md。
 - **A15 SleepAwaiter 和定时器驱动的衔接**: `Wait`、`Cancel` 两个接口, `await_suspend` 里登记、注册 stop callback、挂起三步的顺序; 忙碌的 worker 每运行完一个任务检查一次到期的定时器。见 design/timer.md 4.7、design/scheduler.md 4.1。
 - **A16 定时器的时间经过 `Clock` 接口取得**: 生产环境用真实时钟, 测试里换成可手动拨动的实现, 这样才能移植 tokio 里依赖可暂停时钟的测试。见 design/timer.md 1.1、2.2。
+
+M3 细化时新增:
+
+- **A17 Task 帧的所有权**: 帧归 `Task` 对象所有, 只在 `~Task()` 里销毁; `Awaiter::await_resume()` 只取走产出。debug 构建下断言: 一个 Task 只被 `co_await` 一次; 已启动未结束的 Task 不被销毁。见 design/task.md 2.4、第 3 节。
+- **A18 上下文是线程里的一个指针**: 线程局部存储里放 `PromiseContext*`。Task 启动时把当前上下文复制进自己的 promise 并切换过去, 结束后等待方还原; 调度器恢复协程时装回它挂起时的那一份。见 design/task.md 2.2。
+- **A19 `BlockOn` 的进入条件**: 线程上已经有上下文时抛 `std::runtime_error`, 同一个 Runtime 不能重入; 上一次返回之后可以再调。这取代 A1 里"v1 只支持调用一次 `BlockOn`"的说法。见 design/runtime.md 4.2。
+- **A20 `Builder` 的线程数**: `workers_` 为 0 表示单线程, 默认构造的 `Builder` 等同 `CurrentThread()`; `MultiThread(n)` 的 `Build()` 在 M6 之前抛 `std::runtime_error`。见 design/runtime.md 第 2 节。
+- **A21 `Handle::operator==`**: 比较是否指向同一个运行时。tokio 的 `Handle` 在提交 `1daf3c5a` 上没有这个比较, 是 zenio 补的: 单测要确认协程里拿到的句柄就是那个运行时, 没有它只能比"都有效"。见 design/runtime.md 第 2 节。
+- **A22 M3 的调度器**: 只有一个先进先出的队列, 没有同步; `Schedule` 只能在运行时的线程上调用。M6 换成本地队列、全局队列和同步。见 design/scheduler.md 第 1 节。
 
 ### 1.6 待定事项
 
@@ -122,7 +132,7 @@ src/zenio/
   zenio.h            总入口, 使用者只包含它
   error.h/.cpp       Error / SystemError / CancelledError / ElapsedError
   result.h           Result<T, E>
-  task.h             Task<T> / Yield
+  task.h/.cpp         Task<T> / Yield。Task 的成员都是模板, 定义在头文件里; .cpp 只有 Yield()
   try.h              Try
   cancel.h           Uncancellable
   spawn.h/.cpp       Spawn / SpawnAndSeize / JoinHandle / AbortHandle
@@ -138,11 +148,12 @@ src/zenio/
   detail/            内部实现。公开头文件依赖的五个 (export.h、context.h、awaiters.h、
                      fd.h、io_object.h) 随公开头一起导出, 其余不导出
     export.h         ZENIO_EXPORT 宏 (S23)
-    context.h        PromiseContext / InitialAwaiter / FinalAwaiter / YieldAwaiter
+    context.h/.cpp   PromiseContext / InitialAwaiter / FinalAwaiter / YieldAwaiter, 线程上的当前上下文
     awaiters.h       各操作的 awaiter 类
     fd.h/.cpp        UniqueFd
     io_object.h      IoObject
-    scheduler.*      work-stealing 调度器
+    runtime_core.h/.cpp   RuntimeCore: 运行时的内部对象
+    scheduler.*      work-stealing 调度器 (M3 先做单线程的队列和循环)
     run_queue.*      Chase-Lev 双端队列
     park.*           线程休眠与唤醒
     poller.*         Poller 协程: 命令队列与轮询循环
@@ -150,11 +161,12 @@ src/zenio/
     time_wheel.*     TimerWheel / TimerLevel: 移植 tokio 的时间轮
     time_source.*    Clock / TimeSource
     intrusive_list.h 侵入式双向链表
-    waiter.h         挂起协议
+    waiter.h/.cpp    挂起协议
     driver.h  driver_epoll.cpp  driver_kqueue.cpp
 tests/
   zenio/             单元测试, 目录与 src/zenio 同构, 文件名 *_unittest.cpp
   compile_check/     只编译不链接的 API 编译检查
+  link_check/        链接共享库并运行的链接检查
 ```
 
 ### 1.8 目标用法
@@ -214,7 +226,7 @@ int main() {
 
 ## 2. 进度
 
-设计: 顶层决策已定 (1.4)。M1、M2 的任务书已审查, 可以派给实现会话。子系统文档都还是草稿: 实现会话按原文实现, 觉得不对就记偏差。
+设计: 顶层决策已定 (1.4)。M1、M2、M3 的任务书已审查, 可以派给实现会话。子系统文档的状态见 4.1: M1、M2、M3 涉及的部分已经细化, 其余还是草稿, 实现会话按原文实现, 觉得不对就记偏差。
 
 状态取值: 未开始、进行中、已完成。里程碑实现完成且验收测试全部通过后才能标为已完成。
 
@@ -222,8 +234,8 @@ int main() {
 |------|--------|----------|--------|------|
 | M1 | 公共头文件: `zenio.h`、`detail/export.h`、`detail/context.h` 和全部公开头文件的声明, 不含实现 | API 编译检查通过: 1.8 的目标用法只凭 `<zenio/zenio.h>` 能编译, 不要求链接 | design/milestones/M1.md (已审查) | 已完成 (R1 复验)。实现会话自述的验证: `cmake -S . -B cmake-build-m1 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DZENIO_BUILD_TESTS=ON && cmake --build cmake-build-m1`, 三个目标 (`zenio`、`zenio_unittest`、`zenio_api_compile_check`) 全部构建通过; 反向检查 (0/65 个分支、引用产出分支、`Result<bool>` 布尔转换、`JoinSet` 任务类型、`SpawnAndSeize` 漏写 `co_await` 的警告) 全部符合预期 |
 | M2 | 基础设施的实现: `error`、`result`、`detail/fd`、`net/address`, 以及构建配置 (符号可见性、警告选项、FILE_SET、测试目录) | 各子系统文档列出的单测全部通过; API 编译检查仍然通过; D2 清偿 | design/milestones/M2.md (已审查) | 已完成 (R1 复验)。实现会话自述的验证: `cmake -S . -B cmake-build-m2 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DZENIO_BUILD_TESTS=ON && cmake --build cmake-build-m2 && ctest --test-dir cmake-build-m2 --output-on-failure`, 40 个用例全部通过; `-Wall -Wextra` 下零警告; `cmake -S . -B cmake-build-install -G Ninja -DZENIO_INSTALL=ON` 配置成功 |
-| R1 | M1、M2 审查返工: `Result` 的构造函数、测试改为链接目标文件、ASAN 设置等 | 见 design/milestones/R1.md 第 5 节 | design/milestones/R1.md (已审查) | 已完成。验证: `cmake -S . -B cmake-build-r1 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DZENIO_BUILD_TESTS=ON && cmake --build cmake-build-r1 && ctest --test-dir cmake-build-r1 --output-on-failure` (42 项全过, 四个目标 `zenio_obj`/`zenio`/`zenio_unittest`/`zenio_api_compile_check`, 零警告); `nm -gU cmake-build-r1/src/zenio/libzenio*.dylib \| grep 'zenio::detail'` 无输出; 全新目录 `-DZENIO_ENABLE_ASAN=ON` 构建后不设 `ASAN_OPTIONS` 直接运行单测, 42 项全过无报告; `-DZENIO_BUILD_SHARED_LIBS=OFF` 构建且 ctest 通过; `-DZENIO_INSTALL=ON` 配置成功; 改动文件 clang-format 无差异; `Result<bool>` 布尔转换与 `Select()` 反向检查仍不能编译 |
-| M3 | Task 与单线程 Runtime: `Task<T>`、`Try`、`Builder::CurrentThread()`、`BlockOn`、上下文传播、单线程调度循环 | 10 万层嵌套 `co_await` 不爆栈; 异常在 `co_await` 处原样重抛; `Try` 把任务异常收进 `Err`, `CancelledError` 也被收进去 | 未写, M2 完成前细化 | 未开始 |
+| R1 | M1、M2 审查返工: `Result` 的构造函数、测试改为链接目标文件、ASAN 设置等 | 见 design/milestones/R1.md 第 5 节 | design/milestones/R1.md (已审查) | 已完成。验证: `cmake -S . -B cmake-build-r1 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DZENIO_BUILD_TESTS=ON && cmake --build cmake-build-r1 && ctest --test-dir cmake-build-r1 --output-on-failure` (42 项全过, 四个目标 `zenio_obj`/`zenio`/`zenio_unittest`/`zenio_api_compile_check`, 零警告); `nm -gUC cmake-build-r1/src/zenio/libzenio*.dylib \| awk '{print $3}' \| grep '^zenio::detail::'` 无输出 (R1 当时写的命令 `nm -gU ... \| grep 'zenio::detail'` 匹配不上修饰过的名字, 是条空检查; M3 细化时用这条正确的命令重查过, 结论不变); 全新目录 `-DZENIO_ENABLE_ASAN=ON` 构建后不设 `ASAN_OPTIONS` 直接运行单测, 42 项全过无报告; `-DZENIO_BUILD_SHARED_LIBS=OFF` 构建且 ctest 通过; `-DZENIO_INSTALL=ON` 配置成功; 改动文件 clang-format 无差异; `Result<bool>` 布尔转换与 `Select()` 反向检查仍不能编译 |
+| M3 | Task 与单线程 Runtime: `Task<T>`、`Try`、`Builder::CurrentThread()`、`BlockOn`、`Handle`、上下文传播、单线程调度循环、`Waiter` 的协议 | 10 万层嵌套 `co_await` 不爆栈 (在一个 512 KB 栈的线程上跑, Debug 和 Release 都要过); 异常在 `co_await` 处原样重抛; `Try` 把任务异常收进 `Err`, `CancelledError` 也被收进去; 共享库导出的 `zenio::detail` 符号恰好是 S31 清单里的三个 | design/milestones/M3.md (已审查) | 未开始 |
 | M4 | 定时器 (移植 tokio 时间轮)、kqueue 与 Poller (单线程模式): `Sleep`、TCP 的 accept / connect / read / write | 时间轮的单元测试 (移植自 tokio) 通过; `Sleep` 的精度和取消测试通过; loopback 回显通过; 上千并发连接通过; ASAN 下无泄漏 | 未写, M3 完成前细化 | 未开始 |
 | M5 | 任务派发与取消: `Spawn`、`SpawnAndSeize`、`JoinHandle`、`AbortHandle`、`JoinSet`、`Select`、`Uncancellable` | 取消挂起中的 read 成功; `SpawnAndSeize` 的 child 在调用方的 worker 上启动而调用方被重新投递; `JoinHandle` 丢弃后任务继续运行; `JoinAll` 重抛任务异常且结果按 spawn 顺序排列; `Select` 的输家被取消; 析构后没有残留任务 | 未写, M4 完成前细化 | 未开始 |
 | M6 | `Builder::MultiThread(n)`: Chase-Lev 队列、偷任务、空闲 worker 运行 Poller、`Handle::Spawn` 可从非 Runtime 线程调用 | 4 个 worker 上跑完 10 万个任务; TSAN 下全量单测通过 | 未写, M5 完成前细化 | 未开始 |
@@ -247,6 +259,7 @@ int main() {
 | D11 | 满载时 Poller 排队等待 worker, 没有线程在轮询, I/O 事件要等有 worker 空出来才被处理。定时器不受影响, 忙碌的 worker 会顺手处理 (A15) | 设计取舍 | 需要时让 worker 每运行 N 个任务做一次非阻塞 Poll |
 | D12 | 信号是进程级的: 处理器一旦安装不再卸载, 唤醒管道不关闭; v1 假定一个进程只有一个 Runtime 使用信号 | 设计取舍 | 需要支持多 Runtime 时再处理 |
 | D13 | `Try` 每次调用多一层协程帧 (组合子本身是一个 `Task`) | 设计取舍 | 需要时再改 |
+| D14 | 对称交接的尾调用和 S31 的导出清单只在 Clang 上验证过, 开发机 (macOS) 上没有 GCC。GCC 的协程在低优化级别下是否做尾调用不确定, 10 万层嵌套在它上面可能溢出 | 环境 | M8 在用户提供的 Linux 服务器上验证: 512 KB 栈的嵌套测试在 Debug 和 Release 下都要过, 导出符号的清单要对得上 (S21)。不成立的话再定处理方案 |
 
 ## 4. 设计细则
 
@@ -259,14 +272,14 @@ int main() {
 | design/error.md | 异常类型、`Result`、`Try` | 全部已细化 (M1、M2) | 草稿 |
 | design/net.md | 地址、`UniqueFd`、`IoObject`、TCP、UDP | 地址、`UniqueFd`、`IoObject` 全部已细化 (M1、M2); 套接字的接口已细化 (M1), 内部是概要 (M4 前细化) | 草稿 |
 | design/build.md | 构建、符号导出、测试 | 全部已细化 (M1、M2) | 草稿 |
-| design/task.md | `Task<T>`、上下文传播、awaiter 约定、`Yield` | 接口和 awaiter 约定已细化 (M1); 内部是概要 (M3 前细化) | 草稿 |
-| design/runtime.md | `Runtime`、`Builder`、`Handle` | 接口已细化 (M1); 内部是概要 (M3 前细化, 多线程部分 M6 前细化) | 草稿 |
+| design/task.md | `Task<T>`、上下文传播、awaiter 约定、`Yield` | 全部已细化 (M1 写声明, M3 写实现); `seize_caller_` 的重新投递在 M5 细化 | 草稿 |
+| design/runtime.md | `Runtime`、`Builder`、`Handle` | `CurrentThread` 形态全部已细化 (M3); Poller、定时器驱动、游离任务 (M4、M5), 多线程部分 M6 前细化 | 草稿 |
 | design/spawn.md | `Spawn`、`SpawnAndSeize`、`JoinHandle`、`AbortHandle` | 接口已细化 (M1); 内部是概要 (M5 前细化) | 草稿 |
 | design/join_set.md | `JoinSet<T>` | 接口已细化 (M1); 内部是概要 (M5 前细化) | 草稿 |
 | design/select.md | `Select`、`SelectResult` | 接口已细化 (M1); 内部是概要 (M5 前细化) | 草稿 |
 | design/signal.md | `Signal`、`CtrlC()` | 接口已细化 (M1); 内部是概要 (M7 前细化) | 草稿 |
-| design/waiter.md | 挂起协议、取消、`Uncancellable` | Waiter 的协议已细化; 取消流程是概要 (M5 前细化) | 草稿 |
-| design/scheduler.md | 调度器、队列、休眠唤醒 | 概要 (M3 前细化, 多线程部分 M6 前细化) | 草稿 |
+| design/waiter.md | 挂起协议、取消、`Uncancellable` | Waiter 的协议和实现已细化 (M3); 取消流程是概要 (M5 前细化) | 草稿 |
+| design/scheduler.md | 调度器、队列、休眠唤醒 | 单线程部分全部已细化 (M3), 多线程部分 M6 前细化 | 草稿 |
 | design/poller.md | Poller、Driver、fd 注册表 | 概要 (M4 前细化, epoll 部分 M8 前) | 草稿 |
 | design/timer.md | 定时器: 移植 tokio 的时间轮、时间源、条目状态机 | 移植指南已细化 (M4); `SleepAwaiter` 和驱动的衔接是假设 (A15) | 草稿 |
 
@@ -276,7 +289,7 @@ int main() {
 
 | 模块 | v1 | 对应的 tokio API | 以后 | 子系统文档 |
 |------|----|------------------|------|------------|
-| `runtime` | `Builder::CurrentThread()`、`Builder::MultiThread(n)`、`EnableIo()`、`EnableTime()`、`EnableAll()`、`Build()`; `Runtime::BlockOn`、`Runtime::Spawn`; `Handle::Current()`、`TryCurrent()`、`Enter()`、`Spawn()` | `runtime::Builder` 的 `new_current_thread`、`new_multi_thread`、`worker_threads`、`enable_io`、`enable_time`、`enable_all`、`build`; `Runtime` 的 `block_on`、`spawn`; `Handle` 的 `current`、`try_current`、`enter`、`spawn` | `SpawnBlocking`、线程名等 Builder 选项、`shutdown_background` | design/runtime.md |
+| `runtime` | `Builder::CurrentThread()`、`Builder::MultiThread(n)`、`EnableIo()`、`EnableTime()`、`EnableAll()`、`Build()`; `Runtime::BlockOn`、`Runtime::Spawn`; `Handle::Current()`、`TryCurrent()`、`Enter()`、`Spawn()`、`operator==` | `runtime::Builder` 的 `new_current_thread`、`new_multi_thread`、`worker_threads`、`enable_io`、`enable_time`、`enable_all`、`build`; `Runtime` 的 `block_on`、`spawn`; `Handle` 的 `current`、`try_current`、`enter`、`spawn` | `SpawnBlocking`、线程名等 Builder 选项、`shutdown_background` | design/runtime.md |
 | `net` | 见 design/net.md | `net::TcpListener`、`TcpStream`、`UdpSocket`; `io::AsyncReadExt`、`AsyncWriteExt` 的读写方法 | 主机名形态 (`ToSocketAddrs`、`lookup_host`)、`Readable` / `Writable` (`ready`)、组播、Unix socket | design/net.md |
 | `time` | `Sleep`、`SleepUntil`、`Timeout` | `time::sleep`、`sleep_until`、`timeout`; 定时器本体移植自 `runtime/time/` | `Interval`、可暂停的时钟 (`pause`) | design/select.md、design/timer.md |
 | `task` | `Task<T>`; `Spawn`、`SpawnAndSeize`; `JoinHandle<T>`、`AbortHandle`; `JoinSet<T>`: `Spawn`、`SpawnAndSeize`、`JoinNext`、`JoinAll`、`AbortAll`、`len`、`is_empty`; `Yield` | `task::spawn`、`JoinHandle`、`AbortHandle`、`JoinSet` 的同名方法、`yield_now` | `SpawnBlocking`、`JoinSet::DetachAll`、任务名 | design/spawn.md、design/join_set.md、design/task.md |
