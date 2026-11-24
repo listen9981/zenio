@@ -191,46 +191,47 @@ OBJECT 库不产生链接步骤, 所以头文件只有声明时它也能构建�
 
 ## 4. 关键流程
 
-都在仓库根目录执行。
+都在仓库根目录执行。构建目录固定四个, 不按里程碑新建:
+
+| 目录 | 配置 |
+|------|------|
+| `build-debug` | `Debug`, `ZENIO_BUILD_TESTS=ON` |
+| `build-release` | `Release`, `ZENIO_BUILD_TESTS=ON` |
+| `build-asan` | `Debug`, `ZENIO_BUILD_TESTS=ON`, `ZENIO_ENABLE_ASAN=ON` |
+| `build-tsan` | `Debug`, `ZENIO_BUILD_TESTS=ON`, `ZENIO_ENABLE_TSAN=ON` |
 
 **日常构建和测试** (M2 起):
 
 ```
-cmake -S . -B cmake-build-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DZENIO_BUILD_TESTS=ON
-cmake --build cmake-build-debug
-ctest --test-dir cmake-build-debug --output-on-failure
+cmake -S . -B build-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DZENIO_BUILD_TESTS=ON
+cmake --build build-debug
+ctest --test-dir build-debug --output-on-failure
 ```
 
-**ThreadSanitizer** (M6 起, 涉及并发的里程碑必须跑):
+**ThreadSanitizer** (M6 起, 涉及并发的里程碑必须跑): 用 `build-tsan`。
 
-```
-cmake -S . -B cmake-build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DZENIO_BUILD_TESTS=ON -DZENIO_ENABLE_TSAN=ON
-cmake --build cmake-build-tsan
-ctest --test-dir cmake-build-tsan --output-on-failure
-```
+**AddressSanitizer** (M3 起, 涉及对象生命周期的里程碑必须跑): 用 `build-asan`, 跑之前不设任何 `ASAN_OPTIONS` (S29)。
 
-**AddressSanitizer** (M3 起, 涉及对象生命周期的里程碑必须跑): 同上, 把 `ZENIO_ENABLE_TSAN` 换成 `ZENIO_ENABLE_ASAN`, 目录名换成 `cmake-build-asan`。
+在某个目录里临时换过配置选项 (比如静态库检查的 `-DZENIO_BUILD_SHARED_LIBS=OFF`、安装检查的 `-DZENIO_INSTALL=ON`), 用完要么改回去, 要么删掉目录按上表重新配置。
 
-**检查安装配置** (M2): 只配置, 不执行安装。
+**编译器** (S32): 统一使用 Homebrew LLVM 的 clang, 不使用 Apple Clang。编译器由环境变量指定 (`~/.zshrc` 里 `CC=clang`、`CXX=clang++`, PATH 首位是 `/opt/homebrew/opt/llvm/bin`), 不在 CMakeLists 里写死, 也不传 `-DCMAKE_C(XX)_COMPILER`。开发机之外的机器上按各自环境设置 CC/CXX。
 
-```
-cmake -S . -B cmake-build-install -G Ninja -DZENIO_INSTALL=ON
-```
+CC 和 CXX 没有导出的环境里 (非交互的 shell、IDE、各种工具), CMake 挑的是 `/usr/bin/c++`, 也就是 Apple Clang。所以配置完看一眼 `<构建目录>/CMakeCache.txt` 里的 `CMAKE_CXX_COMPILER`, 应当是 `/opt/homebrew/opt/llvm/bin/clang++`; 不是的话导出 CC、CXX 之后删掉目录重新配置。
 
 ## 5. 不变量
 
 - 只包含 `<zenio/zenio.h>` 就能使用全部公开 API。
 - 公开头文件不包含任何平台头, 包括 `<sys/...>`、`<netinet/...>`、`<arpa/...>`。
 - `zenio_api_compile_check` 不在 `tests/zenio/` 目录下 (那里的 `*.cpp` 会被收进单元测试)。
-- sanitizer 构建使用系统自带的 Apple Clang, 即命令行里的 `/usr/bin/c++`。
+- 工具链统一用 Homebrew LLVM (环境变量 CC/CXX), 不使用 Apple Clang (S32); 不把编译器路径写进 CMakeLists。
 
 ## 6. 已知的坑
 
 - **`tmp.cpp` 占位文件**: 库目标至少要有一个源文件。M1 阶段库只有头文件, `src/zenio/tmp.cpp` 必须留着; M2 有了真正的源文件后再删掉它和 `tests/zenio/tmp.cpp`。
 - **`GLOB_RECURSE` 的范围**: `tests/zenio/` 下的每个 `*.cpp` 都会进 `zenio_unittest`。编译检查的源文件放在那个目录下会因为缺符号而链接失败。
 - **安装前缀**: 根 `CMakeLists.txt` 在没有指定前缀时把安装前缀设成仓库自身, 所以执行 `cmake --install` 会把 `include/` 和 `lib/` 写进仓库。任务书只要求配置成功, 不要求执行安装。
-- **CLion 的构建目录**: `cmake-build-debug` 是 CLion 管理的。从命令行在同一个目录里改配置选项, 可能和 CLion 的配置冲突。命令行验证时用自己的目录名, 比如上面命令里的那些。
-- **sanitizer 运行库**: 如果用 Homebrew 的 LLVM 做 sanitizer 构建, 运行时可能找不到运行库。改用系统自带的 Apple Clang。
+- **CLion 的构建目录**: `cmake-build-debug` 是 CLion 管理的。从命令行在同一个目录里改配置选项, 可能和 CLion 的配置冲突。命令行验证一律用第 4 节的 `build-*` 四个目录。
+- **sanitizer 运行库**: ASAN 和 TSAN 在 Homebrew LLVM 23.1.5 上可用 (2026-11-24, M3 的验收和审查复验里, 两种构建下全量单测各 90 项通过, 没有 sanitizer 报告)。若运行库找不到, 先检查 PATH 与 CC/CXX 是否指向 Homebrew LLVM, 再看 `CMakeCache.txt` 里的 `CMAKE_CXX_COMPILER` 是不是选对了。
 - **`-Wall -Wextra` 下的第三方头**: `GTest::gtest_main` 的头文件目录是系统目录, 不会报警告。
 - **ASAN 报 container-overflow 时先确认构建目录是干净的** (S29): 带和不带 sanitizer 的产物混在同一个目录里, 或者换了编译器没有重新配置, 都可能出看似误报的报告。M2 审查时在全新的 ASAN 构建目录里用默认选项跑全量单测, 没有任何报告。确认能复现之后, 记录复现步骤并登记到债务, 不要直接降低检测项。
 - **单测里的内部符号来自目标文件**: `zenio_unittest` 链接的是 `zenio_obj`, 和共享库 `zenio` 是两份代码。单测通过不代表共享库导出了这些符号; 共享库的导出情况要用 `nm` 单独看 (S28)。
